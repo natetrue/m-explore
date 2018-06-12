@@ -68,6 +68,7 @@ Explore::Explore()
   private_nh_.param("orientation_scale", orientation_scale_, 0.0);
   private_nh_.param("gain_scale", gain_scale_, 1.0);
   private_nh_.param("min_frontier_size", min_frontier_size, 0.5);
+  private_nh_.param("send_move_goals", send_move_goals_, false);
 
   search_ = frontier_exploration::FrontierSearch(costmap_client_.getCostmap(),
                                                  potential_scale_, gain_scale_,
@@ -77,10 +78,13 @@ Explore::Explore()
     marker_array_publisher_ =
         private_nh_.advertise<visualization_msgs::MarkerArray>("frontiers", 10);
   }
+  frontier_publisher_ = private_nh_.advertise<geometry_msgs::PoseArray>("destinations", 10);
 
-  ROS_INFO("Waiting to connect to move_base server");
-  move_base_client_.waitForServer();
-  ROS_INFO("Connected to move_base server");
+  if (send_move_goals_) {
+    ROS_INFO("Waiting to connect to move_base server");
+    move_base_client_.waitForServer();
+    ROS_INFO("Connected to move_base server");
+  }
 
   exploring_timer_ =
       relative_nh_.createTimer(ros::Duration(1. / planner_frequency_),
@@ -187,8 +191,21 @@ void Explore::makePlan()
     ROS_DEBUG("frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
+  geometry_msgs::PoseArray pa;
+  pa.header.frame_id = costmap_client_.getGlobalFrameID();
+  pa.header.stamp = ros::Time::now();
+  for (size_t i = 0; i < frontiers.size(); ++i) {
+    geometry_msgs::Pose p;
+    p.position = frontiers[i].centroid;
+    p.orientation = pose.orientation;
+    pa.poses.push_back(p);
+  }
+  frontier_publisher_.publish(pa);
+
   if (frontiers.empty()) {
-    stop();
+    if (send_move_goals_) {
+      stop();
+    }
     return;
   }
 
@@ -204,7 +221,12 @@ void Explore::makePlan()
                          return goalOnBlacklist(f.centroid);
                        });
   if (frontier == frontiers.end()) {
-    stop();
+    if (send_move_goals_) {
+      stop();
+    }
+    else {
+      frontier_blacklist_.clear();
+    }
     return;
   }
   geometry_msgs::Point target_position = frontier->centroid;
@@ -218,7 +240,7 @@ void Explore::makePlan()
     prev_distance_ = frontier->min_distance;
   }
   // black list if we've made no progress for a long time
-  if (ros::Time::now() - last_progress_ > progress_timeout_) {
+  if (ros::Time::now() - last_progress_ > progress_timeout_ && send_move_goals_) {
     frontier_blacklist_.push_back(target_position);
     ROS_DEBUG("Adding current goal to black list");
     makePlan();
@@ -231,17 +253,19 @@ void Explore::makePlan()
   }
 
   // send goal to move_base if we have something new to pursue
-  move_base_msgs::MoveBaseGoal goal;
-  goal.target_pose.pose.position = target_position;
-  goal.target_pose.pose.orientation.w = 1.;
-  goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.target_pose.header.stamp = ros::Time::now();
-  move_base_client_.sendGoal(
-      goal, [this, target_position](
-                const actionlib::SimpleClientGoalState& status,
-                const move_base_msgs::MoveBaseResultConstPtr& result) {
-        reachedGoal(status, result, target_position);
-      });
+  if (send_move_goals_) {
+    move_base_msgs::MoveBaseGoal goal;
+    goal.target_pose.pose.position = target_position;
+    goal.target_pose.pose.orientation.w = 1.;
+    goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.target_pose.header.stamp = ros::Time::now();
+    move_base_client_.sendGoal(
+        goal, [this, target_position](
+                  const actionlib::SimpleClientGoalState& status,
+                  const move_base_msgs::MoveBaseResultConstPtr& result) {
+          reachedGoal(status, result, target_position);
+        });
+  }
 }
 
 bool Explore::goalOnBlacklist(const geometry_msgs::Point& goal)
@@ -287,9 +311,9 @@ void Explore::start()
 
 void Explore::stop()
 {
-  move_base_client_.cancelAllGoals();
-  exploring_timer_.stop();
-  ROS_INFO("Exploration stopped.");
+  if (send_move_goals_) {
+    move_base_client_.cancelAllGoals();
+  }
 }
 
 }  // namespace explore
